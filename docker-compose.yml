@@ -1,0 +1,10 @@
+services:
+  goondvr:
+    image: ghcr.io/heapofchaos/goondvr:latest
+    container_name: goondvr
+    ports:
+      - 8080:8080
+    volumes:
+      - ./videos:/usr/src/app/videos
+      - ./conf:/usr/src/app/conf
+    restart: unless-stopped

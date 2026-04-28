@@ -1,0 +1,169 @@
+name: Cache Cleanup
+
+# Automatically clean up old caches to prevent hitting the 10 GB limit
+# Runs daily and can be triggered manually
+
+on:
+  schedule:
+    # Run daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      delete_all:
+        description: 'Delete ALL caches immediately (ignores max_age_days)'
+        required: false
+        default: false
+        type: boolean
+      max_age_days:
+        description: 'Delete caches older than X days (ignored if delete_all is true)'
+        required: false
+        default: '7'
+        type: string
+
+permissions:
+  actions: write  # Required to delete caches
+
+jobs:
+  cleanup:
+    name: Clean Up Old Caches
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clean up caches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🧹 Starting cache cleanup..."
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          DELETE_ALL="${{ inputs.delete_all || 'false' }}"
+          MAX_AGE_DAYS="${{ inputs.max_age_days || '7' }}"
+
+          # Count total caches
+          TOTAL_CACHES=$(gh cache list --json id --limit 1000 | jq '. | length')
+          echo "Total caches found: $TOTAL_CACHES"
+          echo ""
+
+          if [ "$TOTAL_CACHES" -eq 0 ]; then
+            echo "✅ No caches found - nothing to clean up"
+            exit 0
+          fi
+
+          if [ "$DELETE_ALL" = "true" ]; then
+            # ── NUKE MODE ─────────────────────────────────────────
+            echo "🚨 DELETE ALL mode enabled — deleting every cache"
+            echo ""
+
+            CACHE_IDS=$(gh cache list --json id --limit 1000 | jq -r '.[].id')
+            DELETED_COUNT=0
+
+            for cache_id in $CACHE_IDS; do
+              if [ -n "$cache_id" ]; then
+                echo "Deleting cache ID: $cache_id"
+                gh cache delete "$cache_id" || echo "Failed to delete cache $cache_id"
+                DELETED_COUNT=$((DELETED_COUNT + 1))
+              fi
+            done
+
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "✅ All caches deleted"
+            echo "Deleted: $DELETED_COUNT / $TOTAL_CACHES caches"
+
+          else
+            # ── AGE-BASED MODE ────────────────────────────────────
+            echo "Mode: age-based cleanup (older than $MAX_AGE_DAYS days)"
+
+            if [[ "$OSTYPE" == "darwin"* ]]; then
+              CUTOFF_DATE=$(date -u -v-${MAX_AGE_DAYS}d +%Y-%m-%dT%H:%M:%SZ)
+            else
+              CUTOFF_DATE=$(date -u -d "$MAX_AGE_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
+            fi
+
+            echo "Cutoff date: $CUTOFF_DATE"
+            echo ""
+
+            echo "📊 Current caches (top 20):"
+            gh cache list --limit 20
+            echo ""
+
+            echo "🗑️  Deleting caches older than $MAX_AGE_DAYS days..."
+
+            CACHE_IDS_TO_DELETE=$(gh cache list --json id,createdAt --limit 1000 | \
+              jq -r '.[] | select(.createdAt < "'"$CUTOFF_DATE"'") | .id')
+
+            DELETED_COUNT=0
+
+            for cache_id in $CACHE_IDS_TO_DELETE; do
+              if [ -n "$cache_id" ]; then
+                echo "Deleting cache ID: $cache_id"
+                gh cache delete "$cache_id" || echo "Failed to delete cache $cache_id"
+                DELETED_COUNT=$((DELETED_COUNT + 1))
+              fi
+            done
+
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "✅ Age-based cleanup complete"
+            echo "Deleted: $DELETED_COUNT caches"
+
+            REMAINING_CACHES=$(gh cache list --json id | jq '. | length')
+            echo "Remaining caches: $REMAINING_CACHES"
+
+            if [ "$REMAINING_CACHES" -gt 0 ]; then
+              echo ""
+              echo "Top 10 remaining caches:"
+              gh cache list --limit 10
+            fi
+          fi
+
+      - name: Check cache storage usage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📊 Cache Storage Summary"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          TOTAL_SIZE=$(gh cache list --json sizeInBytes --limit 1000 | \
+            jq '[.[].sizeInBytes] | add // 0')
+
+          TOTAL_SIZE_GB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024 / 1024" | bc)
+          PERCENTAGE=$(echo "scale=1; $TOTAL_SIZE_GB * 100 / 10" | bc)
+
+          echo "Total cache size: ${TOTAL_SIZE_GB} GB / 10 GB"
+          echo "Usage: ${PERCENTAGE}%"
+
+          # Fixed: critical threshold checked before warning threshold
+          if (( $(echo "$TOTAL_SIZE_GB > 9" | bc -l) )); then
+            echo ""
+            echo "🚨 CRITICAL: Cache usage is very high (${TOTAL_SIZE_GB} GB / 10 GB)"
+            echo "Immediate cleanup recommended!"
+          elif (( $(echo "$TOTAL_SIZE_GB > 8" | bc -l) )); then
+            echo ""
+            echo "⚠️  WARNING: Cache usage is high (${TOTAL_SIZE_GB} GB / 10 GB)"
+            echo "Consider running cleanup more frequently or reducing cache retention"
+          else
+            echo ""
+            echo "✅ Cache usage is healthy (${TOTAL_SIZE_GB} GB / 10 GB)"
+          fi
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: Summary
+        if: always()
+        run: |
+          DELETE_ALL="${{ inputs.delete_all || 'false' }}"
+          echo "## Cache Cleanup Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "$DELETE_ALL" = "true" ]; then
+            echo "- 🚨 **Delete All** mode — all caches wiped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- 📅 Deleted caches older than ${{ inputs.max_age_days || '7' }} days" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "- ✅ Cleanup completed" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 Check logs for detailed cache usage statistics" >> $GITHUB_STEP_SUMMARY

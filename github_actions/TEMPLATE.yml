@@ -1,0 +1,670 @@
+# ============================================================================
+# GoondVR Continuous Runner - Workflow Template
+# ============================================================================
+#
+# This template provides a complete, documented reference for setting up the
+# GoondVR continuous recording system on GitHub Actions. Copy this file to
+# .github/workflows/continuous-runner.yml and customize the inputs and secrets.
+#
+# OVERVIEW:
+# This workflow enables continuous livestream recording despite GitHub Actions'
+# 6-hour job timeout by implementing an auto-restart chain pattern. Each
+# workflow run operates for 5.5 hours, then triggers its replacement before
+# terminating. State persists across runs using GitHub Actions cache.
+#
+# KEY FEATURES:
+# - Auto-restart chain: Workflows trigger their own replacements
+# - Matrix parallelism: Record up to 20 channels simultaneously
+# - Dual storage: Uploads to both Gofile and Filester
+# - State persistence: Configuration and recordings survive transitions
+# - Database organization: Structured metadata in repository
+# - Maximum quality: Attempts 4K 60fps recording
+#
+# LIMITATIONS:
+# - 30-60 second recording gaps during workflow transitions
+# - 6-hour maximum per workflow run (5.5 hours operational)
+# - 14 GB runner disk space limit
+# - 10 GB cache storage limit per repository
+# - 20 concurrent job limit (free tier)
+#
+# SETUP REQUIREMENTS:
+# 1. Fork the GoondVR repository
+# 2. Configure required secrets (see REQUIRED SECRETS section below)
+# 3. Copy this template to .github/workflows/continuous-runner.yml
+# 4. Trigger workflow manually with channel list
+#
+# ============================================================================
+
+name: GoondVR Continuous Runner
+
+# ============================================================================
+# WORKFLOW TRIGGERS
+# ============================================================================
+#
+# This workflow uses manual dispatch (workflow_dispatch) to allow starting
+# the recording system on demand. The workflow can also be triggered by the
+# auto-restart chain mechanism, which passes state from the previous run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ------------------------------------------------------------------------
+      # SESSION STATE (Internal - Auto-Restart Chain)
+      # ------------------------------------------------------------------------
+      # JSON string containing state from the previous workflow run. This is
+      # automatically populated by the Chain_Manager when triggering the next
+      # run. Leave empty when starting manually.
+      #
+      # Format: {"session_id": "...", "start_time": "...", "channels": [...]}
+      session_state:
+        description: 'Session state from previous run (JSON)'
+        required: false
+        type: string
+        default: ''
+      
+      # ------------------------------------------------------------------------
+      # CHANNELS (Required)
+      # ------------------------------------------------------------------------
+      # Comma-separated list of channels to record. Each channel must be in
+      # the format "site:username" where site is either "chaturbate" or
+      # "stripchat".
+      #
+      # Examples:
+      #   - Single channel: "chaturbate:username1"
+      #   - Multiple channels: "chaturbate:user1,stripchat:user2,chaturbate:user3"
+      #
+      # Maximum: 20 channels (GitHub Actions concurrent job limit)
+      channels:
+        description: 'Comma-separated list of channels to record (format: site:username)'
+        required: true
+        type: string
+      
+      # ------------------------------------------------------------------------
+      # MATRIX JOB COUNT (Optional)
+      # ------------------------------------------------------------------------
+      # Number of parallel matrix jobs to create. Each job handles one channel
+      # independently. Must be between 1 and 20.
+      #
+      # Recommendations:
+      #   - 1-5 jobs: Good for testing or limited channels
+      #   - 5-10 jobs: Balanced for moderate usage
+      #   - 10-20 jobs: Maximum parallelism for many channels
+      #
+      # Note: In cost-saving mode, this is automatically limited to 2.
+      matrix_job_count:
+        description: 'Number of parallel matrix jobs (1-20)'
+        required: false
+        type: string
+        default: '5'
+      
+      # ------------------------------------------------------------------------
+      # COST-SAVING MODE (Optional)
+      # ------------------------------------------------------------------------
+      # Enable cost-saving mode to reduce GitHub Actions minutes usage. When
+      # enabled, the workflow:
+      #   - Reduces polling frequency to 10 minutes (from 5 minutes)
+      #   - Limits concurrent recordings to 2 channels maximum
+      #   - Automatically caps matrix_job_count at 2
+      #
+      # Use this mode to stay within GitHub's free tier (2000 minutes/month).
+      cost_saving:
+        description: 'Enable cost-saving mode (10-minute polling, limit to 2 concurrent channels)'
+        required: false
+        type: boolean
+        default: false
+
+# ============================================================================
+# JOBS
+# ============================================================================
+
+jobs:
+  # ==========================================================================
+  # VALIDATION JOB
+  # ==========================================================================
+  #
+  # This job validates all workflow inputs before starting the recording jobs.
+  # It ensures configuration is correct and generates the matrix configuration
+  # for parallel job execution.
+  #
+  # Outputs:
+  #   - matrix_jobs: JSON array of job IDs for matrix strategy
+  #   - session_id: Unique identifier for this workflow run
+  
+  validate:
+    name: Validate Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      matrix_jobs: ${{ steps.generate_matrix.outputs.matrix_jobs }}
+      session_id: ${{ steps.generate_session.outputs.session_id }}
+    
+    steps:
+      # ----------------------------------------------------------------------
+      # STEP 1: Validate Inputs
+      # ----------------------------------------------------------------------
+      # Validates that all workflow inputs are within acceptable ranges and
+      # formats. Applies cost-saving mode restrictions if enabled.
+      
+      - name: Validate inputs
+        id: validate
+        run: |
+          # Validate matrix_job_count is between 1 and 20
+          MATRIX_COUNT="${{ inputs.matrix_job_count }}"
+          if ! [[ "$MATRIX_COUNT" =~ ^[0-9]+$ ]]; then
+            echo "Error: matrix_job_count must be a number"
+            exit 1
+          fi
+          if [ "$MATRIX_COUNT" -lt 1 ] || [ "$MATRIX_COUNT" -gt 20 ]; then
+            echo "Error: matrix_job_count must be between 1 and 20"
+            exit 1
+          fi
+          
+          # In cost-saving mode, limit matrix_job_count to 2
+          if [ "${{ inputs.cost_saving }}" = "true" ]; then
+            if [ "$MATRIX_COUNT" -gt 2 ]; then
+              echo "Warning: Cost-saving mode enabled, limiting matrix jobs to 2 (requested: $MATRIX_COUNT)"
+              MATRIX_COUNT=2
+            fi
+            echo "Cost-saving mode ENABLED: 10-minute polling, max 2 concurrent channels"
+          fi
+          
+          # Validate channels input is not empty
+          if [ -z "${{ inputs.channels }}" ]; then
+            echo "Error: channels input cannot be empty"
+            exit 1
+          fi
+          
+          echo "Validation passed: $MATRIX_COUNT matrix jobs for channels: ${{ inputs.channels }}"
+          echo "validated_matrix_count=$MATRIX_COUNT" >> $GITHUB_OUTPUT
+      
+      # ----------------------------------------------------------------------
+      # STEP 2: Generate Session ID
+      # ----------------------------------------------------------------------
+      # Creates a unique session identifier for this workflow run. The session
+      # ID is used for cache keys, database entries, and tracking across the
+      # auto-restart chain.
+      #
+      # Format: run-YYYYMMDD-HHMMSS-{github.run_id}
+      
+      - name: Generate session ID
+        id: generate_session
+        run: |
+          # Generate unique session ID using run ID and timestamp
+          SESSION_ID="run-$(date +%Y%m%d-%H%M%S)-${{ github.run_id }}"
+          echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
+          echo "Generated session ID: $SESSION_ID"
+      
+      # ----------------------------------------------------------------------
+      # STEP 3: Generate Matrix Configuration
+      # ----------------------------------------------------------------------
+      # Creates a JSON array of job IDs for the matrix strategy. The number
+      # of jobs is determined by the validated matrix_job_count.
+      #
+      # Example output: [1, 2, 3, 4, 5]
+      
+      - name: Generate matrix configuration
+        id: generate_matrix
+        run: |
+          # Generate matrix job IDs based on validated matrix_job_count
+          MATRIX_COUNT="${{ steps.validate.outputs.validated_matrix_count }}"
+          MATRIX_JOBS=$(seq 1 $MATRIX_COUNT | jq -R . | jq -s -c .)
+          echo "matrix_jobs=$MATRIX_JOBS" >> $GITHUB_OUTPUT
+          echo "Generated matrix jobs: $MATRIX_JOBS"
+
+  # ==========================================================================
+  # RECORDING JOB (Matrix)
+  # ==========================================================================
+  #
+  # This job performs the actual recording work. It runs in parallel using
+  # GitHub Actions matrix strategy, with each job handling one channel
+  # independently. Each job has its own 5.5-hour lifecycle and state.
+  #
+  # Matrix Strategy:
+  #   - Creates N jobs based on matrix_job_count input
+  #   - Each job gets a unique job_id (1, 2, 3, ...)
+  #   - Jobs run concurrently on separate runners
+  #   - Jobs do not interfere with each other
+  #   - If one job fails, others continue
+  #
+  # Timeout:
+  #   - 330 minutes (5.5 hours) maximum per job
+  #   - Graceful shutdown begins at 5.4 hours (324 minutes)
+  #   - Auto-restart chain triggers at 5.5 hours
+  
+  record:
+    name: Record (Job ${{ matrix.job_id }})
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 330  # 5.5 hours (5 hours 30 minutes)
+    
+    strategy:
+      matrix:
+        job_id: ${{ fromJson(needs.validate.outputs.matrix_jobs) }}
+      fail-fast: false  # Continue other jobs even if one fails
+      max-parallel: 20  # Allow up to 20 concurrent jobs
+    
+    steps:
+      # ----------------------------------------------------------------------
+      # STEP 1: Checkout Repository
+      # ----------------------------------------------------------------------
+      # Checks out the repository code so the workflow can access the GoondVR
+      # application and database files.
+      #
+      # The GITHUB_TOKEN is used for authentication, which allows the workflow
+      # to commit database updates back to the repository.
+      
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      # ----------------------------------------------------------------------
+      # STEP 2: Restore Shared Configuration Cache
+      # ----------------------------------------------------------------------
+      # Restores shared configuration files that are common to all matrix jobs.
+      # This includes channel configurations, API settings, and other shared
+      # state.
+      #
+      # Cache Key Strategy:
+      #   - Primary: shared-config-latest (most recent shared config)
+      #   - Fallback: shared-config- (any shared config)
+      #
+      # Compression:
+      #   - Uses zstd compression level 19 (maximum without --ultra)
+      #   - Can reduce cache size by up to 10x
+      #   - Maximizes effective use of 10 GB cache limit
+      
+      - name: Restore shared configuration cache
+        uses: actions/cache/restore@v4
+        id: restore_shared_config
+        env:
+          ZSTD_CLEVEL: 19  # Maximum compression level for zstd (1-19)
+        with:
+          path: |
+            ./conf
+          key: shared-config-latest
+          restore-keys: |
+            shared-config-
+      
+      # ----------------------------------------------------------------------
+      # STEP 3: Restore Job-Specific State Cache
+      # ----------------------------------------------------------------------
+      # Restores state specific to this matrix job, including partial
+      # recordings, job-specific configuration, and progress tracking.
+      #
+      # Cache Key Strategy:
+      #   - Primary: state-{session_id}-job-{job_id} (current session)
+      #   - Fallback 1: state-{previous_session_id}-job-{job_id} (previous run)
+      #   - Fallback 2: state-latest-job-{job_id} (any previous state)
+      #
+      # This allows the job to resume from where it left off in the previous
+      # workflow run, maintaining continuity across the auto-restart chain.
+      
+      - name: Restore job-specific state cache
+        uses: actions/cache/restore@v4
+        id: restore_job_state
+        env:
+          ZSTD_CLEVEL: 19  # Maximum compression level for zstd (1-19)
+        with:
+          path: |
+            ./videos
+            ./state
+            ./partial
+          key: state-${{ needs.validate.outputs.session_id }}-job-${{ matrix.job_id }}
+          restore-keys: |
+            state-${{ inputs.session_state }}-job-${{ matrix.job_id }}
+            state-latest-job-${{ matrix.job_id }}
+      
+      # ----------------------------------------------------------------------
+      # STEP 4: Setup Go
+      # ----------------------------------------------------------------------
+      # Installs the Go programming language runtime required to run GoondVR.
+      # Uses Go 1.21 for compatibility with the application.
+      #
+      # The cache: true option enables caching of Go modules to speed up
+      # subsequent workflow runs.
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+      
+      # ----------------------------------------------------------------------
+      # STEP 5: Install Dependencies
+      # ----------------------------------------------------------------------
+      # Downloads all Go module dependencies required by GoondVR.
+      
+      - name: Install dependencies
+        run: |
+          go mod download
+          echo "Dependencies installed successfully"
+      
+      # ----------------------------------------------------------------------
+      # STEP 6: Initialize State
+      # ----------------------------------------------------------------------
+      # Creates necessary directories and logs cache restoration status.
+      # If no cache was found, the job will initialize with default settings.
+      
+      - name: Initialize state
+        run: |
+          # Create necessary directories
+          mkdir -p ./conf ./videos ./state ./partial ./database
+          
+          # Log cache restoration status
+          echo "Shared config cache hit: ${{ steps.restore_shared_config.outputs.cache-hit }}"
+          echo "Job state cache hit: ${{ steps.restore_job_state.outputs.cache-hit }}"
+          
+          # If no cache hit, initialize with defaults
+          if [ "${{ steps.restore_shared_config.outputs.cache-hit }}" != "true" ]; then
+            echo "No shared config cache found, will initialize with defaults"
+          fi
+          
+          if [ "${{ steps.restore_job_state.outputs.cache-hit }}" != "true" ]; then
+            echo "No job state cache found, starting fresh"
+          fi
+      
+      # ----------------------------------------------------------------------
+      # STEP 7: Start Recording
+      # ----------------------------------------------------------------------
+      # Runs the GoondVR application in GitHub Actions mode. This is the main
+      # recording step that operates for up to 5.5 hours.
+      #
+      # Environment Variables:
+      #   - GOFILE_API_KEY: API key for Gofile uploads (from secrets)
+      #   - FILESTER_API_KEY: API key for Filester uploads (from secrets)
+      #   - GITHUB_TOKEN: Token for GitHub API operations (auto-provided)
+      #   - DISCORD_WEBHOOK_URL: Discord webhook for notifications (optional)
+      #   - NTFY_TOKEN: ntfy authentication token (optional)
+      #   - MATRIX_JOB_ID: Unique identifier for this matrix job
+      #   - MATRIX_JOB_COUNT: Total number of matrix jobs
+      #   - SESSION_ID: Unique identifier for this workflow run
+      #   - CHANNELS: Comma-separated list of channels to record
+      #   - SESSION_STATE: State from previous run (for continuity)
+      #   - COST_SAVING: Whether cost-saving mode is enabled
+      #   - GITHUB_REPOSITORY: Repository name (owner/repo)
+      #   - GITHUB_RUN_ID: Unique identifier for this workflow run
+      #
+      # The application will:
+      #   1. Assign channels to this matrix job
+      #   2. Monitor assigned channels for online status
+      #   3. Start recordings when channels go live
+      #   4. Upload completed recordings to Gofile and Filester
+      #   5. Update the database with recording metadata
+      #   6. Trigger the next workflow run at 5.5 hours
+      #   7. Perform graceful shutdown at 5.4 hours
+      
+      - name: Start recording
+        env:
+          GOFILE_API_KEY: ${{ secrets.GOFILE_API_KEY }}
+          FILESTER_API_KEY: ${{ secrets.FILESTER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          MATRIX_JOB_ID: ${{ matrix.job_id }}
+          MATRIX_JOB_COUNT: ${{ steps.validate.outputs.validated_matrix_count }}
+          SESSION_ID: ${{ needs.validate.outputs.session_id }}
+          CHANNELS: ${{ inputs.channels }}
+          SESSION_STATE: ${{ inputs.session_state }}
+          COST_SAVING: ${{ inputs.cost_saving }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "Starting GoondVR in GitHub Actions mode"
+          echo "Session ID: $SESSION_ID"
+          echo "Matrix Job ID: $MATRIX_JOB_ID"
+          echo "Channels: $CHANNELS"
+          echo "Cost-saving mode: $COST_SAVING"
+          
+          # Run GoondVR in GitHub Actions mode
+          go run main.go \
+            --mode github-actions \
+            --matrix-job-id $MATRIX_JOB_ID \
+            --session-id $SESSION_ID \
+            --channels "$CHANNELS" \
+            --max-quality \
+            --cost-saving=$COST_SAVING
+      
+      # ----------------------------------------------------------------------
+      # STEP 8: Save Shared Configuration Cache
+      # ----------------------------------------------------------------------
+      # Saves shared configuration files to cache for use by the next workflow
+      # run. This step runs even if the job fails (if: always()) to ensure
+      # state is preserved.
+      #
+      # The shared configuration is saved with the key "shared-config-latest"
+      # so all matrix jobs can access the most recent configuration.
+      
+      - name: Save shared configuration cache
+        if: always()
+        uses: actions/cache/save@v4
+        env:
+          ZSTD_CLEVEL: 19  # Maximum compression level for zstd (1-19)
+        with:
+          path: |
+            ./conf
+          key: shared-config-latest
+      
+      # ----------------------------------------------------------------------
+      # STEP 9: Save Job-Specific State Cache
+      # ----------------------------------------------------------------------
+      # Saves job-specific state to cache for use by the next workflow run.
+      # This includes partial recordings, progress tracking, and job-specific
+      # configuration.
+      #
+      # The state is saved with a session-specific key to prevent conflicts
+      # between different workflow runs.
+      
+      - name: Save job-specific state cache
+        if: always()
+        uses: actions/cache/save@v4
+        env:
+          ZSTD_CLEVEL: 19  # Maximum compression level for zstd (1-19)
+        with:
+          path: |
+            ./videos
+            ./state
+            ./partial
+          key: state-${{ needs.validate.outputs.session_id }}-job-${{ matrix.job_id }}
+      
+      # ----------------------------------------------------------------------
+      # STEP 10: Upload Artifacts on Failure
+      # ----------------------------------------------------------------------
+      # If the job fails, uploads recordings, state files, and logs to GitHub
+      # Artifacts for debugging and recovery. Artifacts are retained for 7 days.
+      #
+      # This serves as a fallback storage mechanism when the primary upload
+      # to Gofile and Filester fails.
+      
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recordings-job-${{ matrix.job_id }}-${{ github.run_id }}
+          path: |
+            ./videos/**/*
+            ./state/**/*
+            ./logs/**/*
+          retention-days: 7
+          if-no-files-found: ignore
+      
+      # ----------------------------------------------------------------------
+      # STEP 11: Update Status File
+      # ----------------------------------------------------------------------
+      # Creates a status file for this matrix job with current information.
+      # This file is used by the monitoring dashboard to display system status.
+      #
+      # The status file includes:
+      #   - job_id: Unique identifier for this matrix job
+      #   - session_id: Unique identifier for this workflow run
+      #   - run_id: GitHub Actions run ID
+      #   - status: Job status (success, failure, cancelled)
+      #   - started_at: Timestamp when the job started
+      #   - runner: Operating system of the runner
+      
+      - name: Update status file
+        if: always()
+        run: |
+          # Create status directory if it doesn't exist
+          mkdir -p ./status
+          
+          # Generate status file with current job information
+          cat > ./status/job-${{ matrix.job_id }}.json << EOF
+          {
+            "job_id": "${{ matrix.job_id }}",
+            "session_id": "${{ needs.validate.outputs.session_id }}",
+            "run_id": "${{ github.run_id }}",
+            "status": "${{ job.status }}",
+            "started_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "runner": "${{ runner.os }}"
+          }
+          EOF
+          
+          echo "Status file created for job ${{ matrix.job_id }}"
+
+  # ==========================================================================
+  # SUMMARY JOB
+  # ==========================================================================
+  #
+  # This job generates a summary of the workflow run after all recording jobs
+  # complete. It provides a quick overview of the session and next steps.
+  #
+  # The summary is displayed in the GitHub Actions UI and includes:
+  #   - Session ID
+  #   - Number of matrix jobs
+  #   - Channels being recorded
+  #   - Cost-saving mode status
+  #   - Overall workflow status
+  
+  summary:
+    name: Workflow Summary
+    needs: [validate, record]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## GoondVR Continuous Runner Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Session ID:** ${{ needs.validate.outputs.session_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Matrix Jobs:** ${{ steps.validate.outputs.validated_matrix_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Channels:** ${{ inputs.channels }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Cost-Saving Mode:** ${{ inputs.cost_saving }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ needs.record.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ inputs.cost_saving }}" = "true" ]; then
+            echo "### Cost-Saving Mode Active" >> $GITHUB_STEP_SUMMARY
+            echo "- Polling frequency: 10 minutes" >> $GITHUB_STEP_SUMMARY
+            echo "- Concurrent recordings: Limited to 2 channels" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "### System Information" >> $GITHUB_STEP_SUMMARY
+          echo "- Auto-restart chain: Active (triggers at 5.5 hours)" >> $GITHUB_STEP_SUMMARY
+          echo "- Expected recording gaps: 30-60 seconds per transition" >> $GITHUB_STEP_SUMMARY
+          echo "- Storage: Dual upload to Gofile and Filester" >> $GITHUB_STEP_SUMMARY
+          echo "- Quality: Maximum available (up to 4K 60fps)" >> $GITHUB_STEP_SUMMARY
+
+# ============================================================================
+# REQUIRED SECRETS
+# ============================================================================
+#
+# Configure these secrets in your repository settings:
+# Settings > Secrets and variables > Actions > New repository secret
+#
+# REQUIRED:
+#   - GOFILE_API_KEY: API key for Gofile uploads
+#       Obtain from: https://gofile.io/myProfile
+#       Format: Bearer token string
+#
+#   - FILESTER_API_KEY: API key for Filester uploads
+#       Obtain from: https://filester.me/account
+#       Format: Bearer token string
+#
+# OPTIONAL:
+#   - DISCORD_WEBHOOK_URL: Discord webhook URL for notifications
+#       Format: https://discord.com/api/webhooks/{id}/{token}
+#
+#   - NTFY_TOKEN: ntfy authentication token for notifications
+#       Format: Bearer token string
+#
+# AUTOMATIC:
+#   - GITHUB_TOKEN: Automatically provided by GitHub Actions
+#       No configuration needed
+#
+# ============================================================================
+
+# ============================================================================
+# USAGE EXAMPLES
+# ============================================================================
+#
+# Example 1: Record a single channel
+#   channels: "chaturbate:username1"
+#   matrix_job_count: "1"
+#   cost_saving: false
+#
+# Example 2: Record multiple channels with cost-saving mode
+#   channels: "chaturbate:user1,stripchat:user2"
+#   matrix_job_count: "2"
+#   cost_saving: true
+#
+# Example 3: Record many channels with maximum parallelism
+#   channels: "chaturbate:user1,chaturbate:user2,...,chaturbate:user20"
+#   matrix_job_count: "20"
+#   cost_saving: false
+#
+# ============================================================================
+
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# Problem: Workflow fails with "Error: channels input cannot be empty"
+# Solution: Ensure the channels input is provided and not empty
+#
+# Problem: Workflow fails with "Error: matrix_job_count must be between 1 and 20"
+# Solution: Set matrix_job_count to a value between 1 and 20
+#
+# Problem: Cache restoration fails
+# Solution: This is normal for the first run. The workflow will initialize
+#           with default settings and create cache for subsequent runs.
+#
+# Problem: Upload to Gofile or Filester fails
+# Solution: Check that API keys are correctly configured in secrets. The
+#           workflow will fall back to GitHub Artifacts if uploads fail.
+#
+# Problem: Recording gaps are longer than expected
+# Solution: This can happen if the GitHub API is slow to trigger the next
+#           workflow run. The Chain_Manager includes retry logic to minimize
+#           gaps, but some delay is unavoidable.
+#
+# Problem: Disk space exhausted
+# Solution: The Health_Monitor should trigger emergency uploads before disk
+#           space is exhausted. If this happens, reduce the number of
+#           concurrent recordings or enable cost-saving mode.
+#
+# ============================================================================
+
+# ============================================================================
+# COST ESTIMATION
+# ============================================================================
+#
+# GitHub Actions Free Tier: 2000 minutes/month
+#
+# Continuous 24/7 operation with 5 matrix jobs:
+#   - Hours per month: 720 hours
+#   - Minutes per month: 43,200 minutes
+#   - Minutes with 5 jobs: 216,000 minutes
+#   - Cost: Significantly exceeds free tier
+#
+# Cost-saving mode with 2 matrix jobs:
+#   - Minutes per month: 86,400 minutes
+#   - Cost: Still exceeds free tier
+#
+# Recommended approach:
+#   - Run only during specific hours (e.g., 8 hours/day)
+#   - Use self-hosted runners for continuous operation
+#   - Consider alternative platforms with higher free tiers
+#
+# ============================================================================
